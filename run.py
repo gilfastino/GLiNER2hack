@@ -70,7 +70,7 @@ def create_training_arguments(
     save_steps: int = 500,
     eval_steps: int = 500,
     save_total_limit: int = 3,
-    fp16: bool = True,
+    fp16: bool = False,
     dataloader_num_workers: int = 4,
     gradient_accumulation_steps: int = 1,
 ) -> TrainingArguments:
