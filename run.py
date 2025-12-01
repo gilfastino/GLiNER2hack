@@ -242,13 +242,10 @@ def main():
     LORA_ALPHA = 32  # LoRA scaling (typically 2x rank)
     LORA_DROPOUT = 0.1
     
-    # Performance Configuration
-    USE_TORCH_COMPILE = True  # Use torch.compile for faster execution (PyTorch 2.0+)
-    
     # ==========================================================================
     
     # Load HuggingFace token
-    print("\n[1/7] Loading HuggingFace token...")
+    print("\n[1/6] Loading HuggingFace token...")
     try:
         hf_token = load_hf_token()
         print(f"✓ Token loaded successfully (length: {len(hf_token)})")
@@ -257,7 +254,7 @@ def main():
         return
     
     # Load model
-    print(f"\n[2/7] Loading model from HuggingFace: {model_name}...")
+    print(f"\n[2/6] Loading model from HuggingFace: {model_name}...")
     try:
         # Set token in environment for HuggingFace Hub (multiple variable names for compatibility)
         os.environ["HF_TOKEN"] = hf_token
@@ -276,7 +273,7 @@ def main():
     
     # Apply LoRA if enabled
     if USE_LORA:
-        print(f"\n[3/7] Applying LoRA for efficient fine-tuning...")
+        print(f"\n[3/6] Applying LoRA for efficient fine-tuning...")
         try:
             model = apply_lora_to_model(
                 model,
@@ -294,27 +291,21 @@ def main():
             print("Falling back to full fine-tuning...")
             USE_LORA = False
     else:
-        print(f"\n[3/7] Skipping LoRA (full fine-tuning mode)")
+        print(f"\n[3/6] Skipping LoRA (full fine-tuning mode)")
     
-    # Apply torch.compile for faster execution
-    if USE_TORCH_COMPILE:
-        print(f"\n[4/7] Applying torch.compile for optimization...")
-        if hasattr(torch, 'compile'):
-            try:
-                # Use reduce-overhead mode for best training performance
-                model = torch.compile(model, mode="reduce-overhead")
-                print(f"✓ torch.compile applied successfully (mode: reduce-overhead)")
-            except Exception as e:
-                print(f"⚠ torch.compile failed: {e}")
-                print("  Continuing without compilation...")
-        else:
-            print(f"⚠ torch.compile not available (requires PyTorch 2.0+)")
-            print("  Continuing without compilation...")
+    # Move model to GPU
+    print(f"\n[4/6] Moving model to GPU...")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        model = model.to(device)
+        print(f"✓ Model moved to GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  - GPU Memory allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
     else:
-        print(f"\n[4/7] Skipping torch.compile")
+        device = torch.device("cpu")
+        print(f"⚠ CUDA not available, using CPU (training will be slow)")
     
     # Load and prepare dataset
-    print(f"\n[5/7] Loading dataset from: {data_path}...")
+    print(f"\n[5/6] Loading dataset from: {data_path}...")
     try:
         dataset = ExtractorDataset(data_path)
         print(f"✓ Dataset loaded: {len(dataset)} samples")
@@ -326,7 +317,7 @@ def main():
     data_collator = ExtractorDataCollator()
     
     # Create training arguments
-    print(f"\n[6/7] Setting up training configuration...")
+    print(f"\n[6/6] Setting up training configuration...")
     
     # Determine precision: prefer bf16 > fp16 > fp32
     use_bf16 = False
@@ -358,7 +349,6 @@ def main():
     print(f"  - Training mode: {'LoRA' if USE_LORA else 'Full Fine-tuning'}")
     
     # Create trainer with appropriate learning rates
-    print(f"\n[7/7] Initializing trainer...")
     
     # LoRA uses higher learning rates since we're training fewer parameters
     if USE_LORA:
