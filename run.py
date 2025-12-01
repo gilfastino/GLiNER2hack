@@ -4,18 +4,29 @@ Training script for GLiNER2 model on prompt injection detection dataset.
 
 This script:
 - Loads the pre-trained model from HuggingFace (fastino/gliner2-large-v1)
+- Supports LoRA (Low-Rank Adaptation) for efficient fine-tuning
 - Trains on the prompt injection dataset
 - Times the entire training process end-to-end
 """
 
 import os
-import json
 import time
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
+# Set tokenizers parallelism before importing transformers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 from transformers import TrainingArguments
+
+# Try to import peft for LoRA support
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    HAS_PEFT = True
+except ImportError:
+    HAS_PEFT = False
+    print("Warning: peft not installed. LoRA training unavailable. Install with: pip install peft")
 
 # Try to import dotenv, but continue if not available
 try:
@@ -27,6 +38,97 @@ except ImportError:
 
 from gliner2.model import Extractor
 from gliner2.trainer import ExtractorDataset, ExtractorDataCollator, ExtractorTrainer
+
+
+# =============================================================================
+# LoRA Configuration
+# =============================================================================
+
+def apply_lora_to_model(
+    model: Extractor,
+    r: int = 16,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.1,
+    target_modules: Optional[List[str]] = None,
+) -> Extractor:
+    """
+    Apply LoRA (Low-Rank Adaptation) to the model's encoder for efficient fine-tuning.
+    
+    LoRA freezes the pre-trained model weights and injects trainable low-rank
+    decomposition matrices into transformer layers, dramatically reducing the
+    number of trainable parameters.
+    
+    Args:
+        model: The Extractor model to apply LoRA to
+        r: LoRA rank (lower = fewer params, higher = more capacity). Default 16.
+        lora_alpha: LoRA scaling factor. Default 32.
+        lora_dropout: Dropout probability for LoRA layers. Default 0.1.
+        target_modules: List of module names to apply LoRA to. 
+                       If None, targets attention layers (query, key, value, dense).
+    
+    Returns:
+        Model with LoRA applied to the encoder
+        
+    Raises:
+        ImportError: If peft library is not installed
+    """
+    if not HAS_PEFT:
+        raise ImportError(
+            "peft library is required for LoRA training. "
+            "Install with: pip install peft"
+        )
+    
+    if target_modules is None:
+        # Target attention layers - these names work for most BERT-like models
+        target_modules = ["query", "key", "value", "dense"]
+    
+    # Create LoRA configuration
+    lora_config = LoraConfig(
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        lora_dropout=lora_dropout,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    
+    # Apply LoRA to the encoder
+    model.encoder = get_peft_model(model.encoder, lora_config)
+    
+    # Freeze all parameters except LoRA layers and classifier
+    for name, param in model.named_parameters():
+        # Keep LoRA parameters trainable
+        if "lora" in name.lower():
+            param.requires_grad = True
+        # Keep classifier trainable
+        elif "classifier" in name.lower():
+            param.requires_grad = True
+        # Keep count prediction head trainable
+        elif "count_pred" in name.lower():
+            param.requires_grad = True
+        # Keep count embedding trainable
+        elif "count_embed" in name.lower():
+            param.requires_grad = True
+        # Freeze everything else
+        else:
+            param.requires_grad = False
+    
+    # Calculate and print parameter counts
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    
+    print(f"\n🔧 LoRA Configuration Applied:")
+    print(f"  - Rank (r): {r}")
+    print(f"  - Alpha: {lora_alpha}")
+    print(f"  - Dropout: {lora_dropout}")
+    print(f"  - Target modules: {target_modules}")
+    print(f"\n📊 Parameter Summary:")
+    print(f"  - Total parameters: {total_params:,}")
+    print(f"  - Trainable parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    print(f"  - Frozen parameters: {frozen_params:,} ({100*frozen_params/total_params:.2f}%)")
+    
+    return model
 
 
 def load_hf_token() -> str:
@@ -124,13 +226,23 @@ def main():
     # Start timing
     start_time = time.time()
     
+    # ==========================================================================
     # Configuration
+    # ==========================================================================
     model_name = "fastino/gliner2-large-v1"
     data_path = "data/prompt_injection_dataset_extractor_format.jsonl"
     output_dir = "./output"
     
+    # LoRA Configuration - Set to True for efficient fine-tuning
+    USE_LORA = True  # Toggle LoRA training on/off
+    LORA_R = 16      # LoRA rank (8-64 typical, higher = more capacity)
+    LORA_ALPHA = 32  # LoRA scaling (typically 2x rank)
+    LORA_DROPOUT = 0.1
+    
+    # ==========================================================================
+    
     # Load HuggingFace token
-    print("\n[1/5] Loading HuggingFace token...")
+    print("\n[1/6] Loading HuggingFace token...")
     try:
         hf_token = load_hf_token()
         print(f"✓ Token loaded successfully (length: {len(hf_token)})")
@@ -139,7 +251,7 @@ def main():
         return
     
     # Load model
-    print(f"\n[2/5] Loading model from HuggingFace: {model_name}...")
+    print(f"\n[2/6] Loading model from HuggingFace: {model_name}...")
     try:
         # Set token in environment for HuggingFace Hub (multiple variable names for compatibility)
         os.environ["HF_TOKEN"] = hf_token
@@ -156,8 +268,30 @@ def main():
         print(f"✗ Error loading model: {e}")
         return
     
+    # Apply LoRA if enabled
+    if USE_LORA:
+        print(f"\n[3/6] Applying LoRA for efficient fine-tuning...")
+        try:
+            model = apply_lora_to_model(
+                model,
+                r=LORA_R,
+                lora_alpha=LORA_ALPHA,
+                lora_dropout=LORA_DROPOUT,
+            )
+            print(f"✓ LoRA applied successfully")
+        except ImportError as e:
+            print(f"✗ Error: {e}")
+            print("Falling back to full fine-tuning...")
+            USE_LORA = False
+        except Exception as e:
+            print(f"✗ Error applying LoRA: {e}")
+            print("Falling back to full fine-tuning...")
+            USE_LORA = False
+    else:
+        print(f"\n[3/6] Skipping LoRA (full fine-tuning mode)")
+    
     # Load and prepare dataset
-    print(f"\n[3/5] Loading dataset from: {data_path}...")
+    print(f"\n[4/6] Loading dataset from: {data_path}...")
     try:
         dataset = ExtractorDataset(data_path)
         print(f"✓ Dataset loaded: {len(dataset)} samples")
@@ -169,15 +303,15 @@ def main():
     data_collator = ExtractorDataCollator()
     
     # Create training arguments
-    print(f"\n[4/5] Setting up training configuration...")
+    print(f"\n[5/6] Setting up training configuration...")
     training_args = create_training_arguments(
         output_dir=output_dir,
         num_epochs=3,
         batch_size=8,
-        learning_rate=2e-5,
+        learning_rate=2e-4 if USE_LORA else 2e-5,  # Higher LR for LoRA
         warmup_steps=100,
-        logging_steps=10,
-        save_steps=500,
+        logging_steps=50,
+        save_steps=1000,
         fp16=torch.cuda.is_available(),
     )
     print(f"✓ Training arguments configured")
@@ -185,18 +319,28 @@ def main():
     print(f"  - Epochs: {training_args.num_train_epochs}")
     print(f"  - Batch size: {training_args.per_device_train_batch_size}")
     print(f"  - FP16: {training_args.fp16}")
+    print(f"  - Training mode: {'LoRA' if USE_LORA else 'Full Fine-tuning'}")
     
-    # Create trainer
-    print(f"\n[5/5] Initializing trainer...")
+    # Create trainer with appropriate learning rates
+    print(f"\n[6/6] Initializing trainer...")
+    
+    # LoRA uses higher learning rates since we're training fewer parameters
+    if USE_LORA:
+        encoder_lr = 3e-4  # Higher LR for LoRA layers
+        custom_lr = 2e-4   # Higher LR for classifier
+    else:
+        encoder_lr = 1e-5  # Lower LR for full encoder fine-tuning
+        custom_lr = 2e-5   # Lower LR for classifier
+    
     trainer = ExtractorTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         data_collator=data_collator,
-        encoder_lr=1e-5,  # Lower LR for encoder
-        custom_lr=2e-5,   # Higher LR for classifier and other layers
+        encoder_lr=encoder_lr,
+        custom_lr=custom_lr,
         weight_decay=0.01,
-        finetune_classifier=False,  # Set to True to only train classifier
+        finetune_classifier=False,
     )
     print(f"✓ Trainer initialized")
     print(f"  - Encoder LR: {trainer.encoder_lr}")
