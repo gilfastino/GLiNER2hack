@@ -172,7 +172,8 @@ def create_training_arguments(
     save_steps: int = 1000,
     eval_steps: int = 1000,
     save_total_limit: int = 3,
-    fp16: bool = True,
+    bf16: bool = False,
+    fp16: bool = False,
     dataloader_num_workers: int = 4,
     gradient_accumulation_steps: int = 1,
 ) -> TrainingArguments:
@@ -189,7 +190,8 @@ def create_training_arguments(
         save_steps: Checkpoint saving frequency
         eval_steps: Evaluation frequency
         save_total_limit: Maximum number of checkpoints to keep
-        fp16: Whether to use mixed precision training
+        bf16: Whether to use bfloat16 mixed precision (preferred over fp16)
+        fp16: Whether to use fp16 mixed precision (fallback if bf16 unavailable)
         dataloader_num_workers: Number of dataloader workers
         gradient_accumulation_steps: Gradient accumulation steps
         
@@ -207,6 +209,7 @@ def create_training_arguments(
         save_steps=save_steps,
         eval_steps=eval_steps,
         save_total_limit=save_total_limit,
+        bf16=bf16,
         fp16=fp16,
         dataloader_num_workers=dataloader_num_workers,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -239,10 +242,13 @@ def main():
     LORA_ALPHA = 32  # LoRA scaling (typically 2x rank)
     LORA_DROPOUT = 0.1
     
+    # Performance Configuration
+    USE_TORCH_COMPILE = True  # Use torch.compile for faster execution (PyTorch 2.0+)
+    
     # ==========================================================================
     
     # Load HuggingFace token
-    print("\n[1/6] Loading HuggingFace token...")
+    print("\n[1/7] Loading HuggingFace token...")
     try:
         hf_token = load_hf_token()
         print(f"✓ Token loaded successfully (length: {len(hf_token)})")
@@ -251,7 +257,7 @@ def main():
         return
     
     # Load model
-    print(f"\n[2/6] Loading model from HuggingFace: {model_name}...")
+    print(f"\n[2/7] Loading model from HuggingFace: {model_name}...")
     try:
         # Set token in environment for HuggingFace Hub (multiple variable names for compatibility)
         os.environ["HF_TOKEN"] = hf_token
@@ -270,7 +276,7 @@ def main():
     
     # Apply LoRA if enabled
     if USE_LORA:
-        print(f"\n[3/6] Applying LoRA for efficient fine-tuning...")
+        print(f"\n[3/7] Applying LoRA for efficient fine-tuning...")
         try:
             model = apply_lora_to_model(
                 model,
@@ -288,10 +294,27 @@ def main():
             print("Falling back to full fine-tuning...")
             USE_LORA = False
     else:
-        print(f"\n[3/6] Skipping LoRA (full fine-tuning mode)")
+        print(f"\n[3/7] Skipping LoRA (full fine-tuning mode)")
+    
+    # Apply torch.compile for faster execution
+    if USE_TORCH_COMPILE:
+        print(f"\n[4/7] Applying torch.compile for optimization...")
+        if hasattr(torch, 'compile'):
+            try:
+                # Use reduce-overhead mode for best training performance
+                model = torch.compile(model, mode="reduce-overhead")
+                print(f"✓ torch.compile applied successfully (mode: reduce-overhead)")
+            except Exception as e:
+                print(f"⚠ torch.compile failed: {e}")
+                print("  Continuing without compilation...")
+        else:
+            print(f"⚠ torch.compile not available (requires PyTorch 2.0+)")
+            print("  Continuing without compilation...")
+    else:
+        print(f"\n[4/7] Skipping torch.compile")
     
     # Load and prepare dataset
-    print(f"\n[4/6] Loading dataset from: {data_path}...")
+    print(f"\n[5/7] Loading dataset from: {data_path}...")
     try:
         dataset = ExtractorDataset(data_path)
         print(f"✓ Dataset loaded: {len(dataset)} samples")
@@ -303,7 +326,17 @@ def main():
     data_collator = ExtractorDataCollator()
     
     # Create training arguments
-    print(f"\n[5/6] Setting up training configuration...")
+    print(f"\n[6/7] Setting up training configuration...")
+    
+    # Determine precision: prefer bf16 > fp16 > fp32
+    use_bf16 = False
+    use_fp16 = False
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            use_bf16 = True
+        else:
+            use_fp16 = True
+    
     training_args = create_training_arguments(
         output_dir=output_dir,
         num_epochs=3,
@@ -312,17 +345,20 @@ def main():
         warmup_steps=100,
         logging_steps=50,
         save_steps=1000,
-        fp16=torch.cuda.is_available(),
+        bf16=use_bf16,
+        fp16=use_fp16,
     )
+    
+    precision_mode = "bf16" if use_bf16 else ("fp16" if use_fp16 else "fp32")
     print(f"✓ Training arguments configured")
     print(f"  - Output directory: {output_dir}")
     print(f"  - Epochs: {training_args.num_train_epochs}")
     print(f"  - Batch size: {training_args.per_device_train_batch_size}")
-    print(f"  - FP16: {training_args.fp16}")
+    print(f"  - Precision: {precision_mode}")
     print(f"  - Training mode: {'LoRA' if USE_LORA else 'Full Fine-tuning'}")
     
     # Create trainer with appropriate learning rates
-    print(f"\n[6/6] Initializing trainer...")
+    print(f"\n[7/7] Initializing trainer...")
     
     # LoRA uses higher learning rates since we're training fewer parameters
     if USE_LORA:
