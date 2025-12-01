@@ -331,8 +331,8 @@ def main():
     training_args = create_training_arguments(
         output_dir=output_dir,
         num_epochs=3,
-        batch_size=8,
-        learning_rate=2e-4 if USE_LORA else 2e-5,  # Higher LR for LoRA
+        batch_size=16,  # Increased from 8
+        learning_rate=3e-4 if USE_LORA else 3e-5,  # Higher LR for larger batch
         warmup_steps=100,
         logging_steps=50,
         save_steps=1000,
@@ -351,12 +351,13 @@ def main():
     # Create trainer with appropriate learning rates
     
     # LoRA uses higher learning rates since we're training fewer parameters
+    # Rates increased for batch_size=16 (scaled ~1.4x from batch_size=8)
     if USE_LORA:
-        encoder_lr = 3e-4  # Higher LR for LoRA layers
-        custom_lr = 2e-4   # Higher LR for classifier
+        encoder_lr = 4e-4  # Higher LR for LoRA layers (was 3e-4 for batch=8)
+        custom_lr = 3e-4   # Higher LR for classifier (was 2e-4 for batch=8)
     else:
-        encoder_lr = 1e-5  # Lower LR for full encoder fine-tuning
-        custom_lr = 2e-5   # Lower LR for classifier
+        encoder_lr = 1.5e-5  # Lower LR for full encoder fine-tuning
+        custom_lr = 3e-5     # Lower LR for classifier
     
     trainer = ExtractorTrainer(
         model=model,
